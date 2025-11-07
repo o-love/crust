@@ -1,0 +1,20 @@
+/target
+/test
+
+# Generated protobuf code (regenerated during build)
+/src/proto/
+
+# Rust backup files
+**/*.rs.bk
+*.pdb
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-specific files
+.DS_Store
+Thumbs.db
