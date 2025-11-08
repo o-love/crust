@@ -171,14 +171,9 @@ impl ImageDir {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
-        // Pages file has same 12-byte header
-        if buffer.len() < 12 {
-            return Err(CrustError::InvalidImage {
-                reason: format!("{} is too small (< 12 bytes)", filename),
-            });
-        }
-
-        Ok(buffer[12..].to_vec())
+        // Pages file is raw binary data with NO HEADER (O_NOBUF in CRIU)
+        // Unlike other image files, return entire contents
+        Ok(buffer)
     }
 
     /// Helper: Read entire image file into buffer (with header validation)

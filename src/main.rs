@@ -54,15 +54,26 @@ fn main() -> anyhow::Result<()> {
 
     if fork_result == 0 {
         // Child process
-        log::debug!("Child process created with PID: {}", std::process::id());
+        let child_pid = std::process::id();
+        log::info!("Child process running with PID: {}", child_pid);
 
         // Verify PID allocation
-        if std::process::id() != target_pid as u32 {
-            log::error!("PID mismatch: expected {}, got {}", target_pid, std::process::id());
+        if child_pid != target_pid as u32 {
+            log::error!("PID mismatch: expected {}, got {}", target_pid, child_pid);
             std::process::exit(1);
         }
 
-        log::debug!("PID allocation verified");
+        log::info!("PID allocation verified");
+
+        // Premap and populate VMAs with page data
+        log::info!("Premapping and populating VMAs...");
+        let vma_entries = unsafe {
+            crust::restore::premap_and_populate_vmas(&checkpoint, child_pid)
+                .expect("Failed to premap VMAs")
+        };
+
+        log::info!("Successfully premapped {} VMAs", vma_entries.len());
+
         std::process::exit(0);
     }
 
