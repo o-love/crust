@@ -53,10 +53,10 @@ readelf -r restorer.elf | grep "\.text"
 ```
 
 **Current status:**
-- ✅ Zero relocations in .text
-- ✅ Blob size: 158 bytes
-- ✅ Contains direct syscalls
-- ✅ rt_sigreturn at end
+- Zero relocations in .text
+- Blob size: 158 bytes
+- Contains direct syscalls
+- rt_sigreturn at end
 
 ## Structure
 

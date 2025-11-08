@@ -37,7 +37,7 @@ impl ImageDir {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
-        // CRIU image format:
+        // Image format:
         // - 4 bytes: magic number
         // - 4 bytes: image type identifier
         // - 4 bytes: payload size (little-endian u32)

@@ -26,6 +26,7 @@ clap = { version = "4.5", features = ["derive"] }
 
 # System calls
 libc = "0.2"
+crust-syscall = { path = "crust-syscall" }
 
 [build-dependencies]
 # For generating protobuf code from .proto files

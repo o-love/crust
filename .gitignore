@@ -1,4 +1,5 @@
 /target
+**/target
 /test
 
 # Generated protobuf code (regenerated during build)

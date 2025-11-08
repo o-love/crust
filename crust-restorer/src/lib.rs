@@ -47,7 +47,7 @@ pub extern "C" fn _start(args: *const TaskRestoreArgs) -> ! {
     unsafe {
         let args = &*args;
 
-        // Step 1: Unmap old VMAs (CRIU's memory)
+        // Step 1: Unmap old VMAs (parent's memory)
         unmap_old_vmas(args);
 
         // Step 2: Restore VMAs to final addresses
@@ -58,11 +58,11 @@ pub extern "C" fn _start(args: *const TaskRestoreArgs) -> ! {
     }
 }
 
-/// Unmap CRIU's memory (everything except bootstrap and premapped VMAs)
+/// Unmap parent's memory (everything except bootstrap and premapped VMAs)
 #[inline(always)]
 unsafe fn unmap_old_vmas(_args: &TaskRestoreArgs) {
     // For MVP: Simply unmap the bootstrap region at the end
-    // Full implementation would unmap all CRIU mappings
+    // Full implementation would unmap all parent mappings
 
     // We'll do this at the very end, just before rt_sigreturn
     // For now, just a placeholder

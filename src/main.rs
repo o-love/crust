@@ -1,5 +1,7 @@
 use clap::Parser;
 use crust::images::ImageDir;
+use crust::restore::{find_bootstrap_gap, inject_restorer_blob};
+use crust::restorer_blob::RESTORER_BLOB;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -13,6 +15,10 @@ struct Args {
     /// Verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Only parse checkpoint without attempting restore
+    #[arg(long)]
+    parse_only: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -22,10 +28,10 @@ fn main() -> anyhow::Result<()> {
     let log_level = if args.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
-    log::info!("crust - CRIU restore in Rust");
+    log::info!("crust - Checkpoint restore in Rust");
     log::info!("Image directory: {}", args.image_dir.display());
 
-    // Load CRIU checkpoint
+    // Load checkpoint
     let img_dir = ImageDir::open(&args.image_dir)?;
     let checkpoint = img_dir.load_checkpoint()?;
 
@@ -33,6 +39,59 @@ fn main() -> anyhow::Result<()> {
 
     // Display checkpoint information
     checkpoint.display()?;
+
+    // If parse-only mode, stop here
+    if args.parse_only {
+        log::info!("Parse-only mode: skipping restore");
+        return Ok(());
+    }
+
+    // Find bootstrap region avoiding conflicts with target and current process
+    log::info!("Finding bootstrap region...");
+    const PAGE_SIZE: usize = 4096;
+    const MMAP_MIN_ADDR: usize = 0x10000;  // Typical kernel mmap_min_addr
+
+    // Round up blob size to page size
+    let blob_size = RESTORER_BLOB.len();
+    let bootstrap_size = (blob_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    let target_addr = find_bootstrap_gap(
+        &checkpoint.mm.vmas,
+        std::process::id(),
+        MMAP_MIN_ADDR,
+        bootstrap_size,
+    )?;
+
+    log::info!("Found bootstrap address: 0x{:x} (size: {} bytes)", target_addr, bootstrap_size);
+    log::info!("  - Checked against {} target VMAs", checkpoint.mm.vmas.len());
+    log::info!("  - Checked against current process VMAs");
+
+    // Inject restorer blob
+    log::info!("Injecting restorer blob ({} bytes)...", RESTORER_BLOB.len());
+    unsafe {
+        let entry_point = inject_restorer_blob(target_addr)?;
+        log::info!("Blob injected successfully at 0x{:x}", entry_point);
+
+        // Verify blob contents
+        let injected = std::slice::from_raw_parts(
+            entry_point as *const u8,
+            RESTORER_BLOB.len()
+        );
+
+        if injected == RESTORER_BLOB {
+            log::info!("Blob verification: PASSED ({} bytes match)", injected.len());
+        } else {
+            log::error!("Blob verification: FAILED (contents don't match)");
+            return Err(anyhow::anyhow!("Blob verification failed"));
+        }
+
+        log::info!("Phase 2 blob injection: SUCCESS");
+
+        // Clean up - unmap blob (Phase 3 will do actual execution)
+        log::debug!("Unmapping blob...");
+        let _ = crust_syscall::syscalls::munmap(entry_point, 4096);
+        log::debug!("Blob unmapped");
+    }
 
     Ok(())
 }
