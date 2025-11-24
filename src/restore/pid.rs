@@ -12,6 +12,63 @@ use std::io::Write;
 
 const SIGCHLD: u64 = 17;
 
+/// Check if a PID exists and optionally kill it
+///
+/// Uses kill(pid, 0) to check existence, then SIGKILL to terminate.
+/// Waits up to 1 second for process to exit.
+///
+/// If force=false and PID exists, returns an error.
+/// If force=true and PID exists, kills it and waits for cleanup.
+pub fn kill_pid_if_exists(pid: i32, force: bool) -> Result<()> {
+    // Check if PID exists using kill(pid, 0)
+    let exists = unsafe {
+        libc::kill(pid, 0) == 0
+    };
+
+    if !exists {
+        // PID doesn't exist, nothing to do
+        return Ok(());
+    }
+
+    if !force {
+        return Err(CrustError::PidControl(format!(
+            "PID {} already exists. Use --kill-old-pid to force kill it.",
+            pid
+        )));
+    }
+
+    // Force kill the existing process
+    log::warn!("Killing existing process with PID {}", pid);
+    unsafe {
+        if libc::kill(pid, libc::SIGKILL) != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(CrustError::PidControl(format!(
+                "Failed to kill PID {}: {}",
+                pid, err
+            )));
+        }
+    }
+
+    // Wait for process to exit (up to 1 second)
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let still_exists = unsafe {
+            libc::kill(pid, 0) == 0
+        };
+
+        if !still_exists {
+            log::info!("Successfully killed PID {}", pid);
+            return Ok(());
+        }
+    }
+
+    Err(CrustError::PidControl(format!(
+        "PID {} did not exit after SIGKILL (timeout)",
+        pid
+    )))
+}
+
 /// Fork a new process with the specified PID using clone3
 ///
 /// Uses the clone3 syscall with set_tid to allocate an exact PID.

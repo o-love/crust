@@ -10,16 +10,24 @@
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct TaskRestoreArgs {
-    /// Base address of bootstrap region to unmap
+    /// Base address of bootstrap region (includes blob + args, for unmapping parent memory)
     pub bootstrap_base: usize,
-    /// Length of bootstrap region to unmap
+    /// Length of bootstrap region (from blob start to bootstrap end)
     pub bootstrap_len: usize,
+    /// Base address of premap region (where VMAs are temporarily mapped)
+    pub premap_addr: usize,
+    /// Length of premap region (total size of all premapped VMAs)
+    pub premap_len: usize,
     /// Number of VMAs to restore
     pub vma_count: usize,
     /// Pointer to VMA array (must be valid in target process)
     pub vmas: *const VmaEntry,
     /// Pointer to sigframe for rt_sigreturn (must be 64-byte aligned)
     pub sigframe: *const u8,
+    /// FS base register value (for TLS)
+    pub fs_base: u64,
+    /// GS base register value (for TLS)
+    pub gs_base: u64,
 }
 
 /// VMA entry describing a memory region to restore
@@ -68,3 +76,25 @@ impl VmaEntry {
 // (though we won't actually do this in practice)
 unsafe impl Send for TaskRestoreArgs {}
 unsafe impl Sync for TaskRestoreArgs {}
+
+// Compile-time verification of struct layout
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use std::mem;
+
+    #[test]
+    fn verify_taskrestoreargs_layout() {
+        // Blob expects these exact offsets
+        assert_eq!(mem::offset_of!(TaskRestoreArgs, bootstrap_base), 0x00);
+        assert_eq!(mem::offset_of!(TaskRestoreArgs, bootstrap_len), 0x08);
+        assert_eq!(mem::offset_of!(TaskRestoreArgs, premap_addr), 0x10);
+        assert_eq!(mem::offset_of!(TaskRestoreArgs, premap_len), 0x18);
+        assert_eq!(mem::offset_of!(TaskRestoreArgs, vma_count), 0x20);
+        assert_eq!(mem::offset_of!(TaskRestoreArgs, vmas), 0x28);
+        assert_eq!(mem::offset_of!(TaskRestoreArgs, sigframe), 0x30);
+        assert_eq!(mem::offset_of!(TaskRestoreArgs, fs_base), 0x38);
+        assert_eq!(mem::offset_of!(TaskRestoreArgs, gs_base), 0x40);
+        assert_eq!(mem::size_of::<TaskRestoreArgs>(), 72);
+    }
+}

@@ -35,6 +35,13 @@ pub unsafe fn munmap(addr: usize, length: usize) -> Result<(), Errno> {
     Errno::from_syscall_ret(ret).map(|_| ())
 }
 
+/// Change memory protection
+#[inline(always)]
+pub unsafe fn mprotect(addr: usize, length: usize, prot: i32) -> Result<(), Errno> {
+    let ret = raw::syscall3(SYS_MPROTECT, addr as u64, length as u64, prot as u64);
+    Errno::from_syscall_ret(ret).map(|_| ())
+}
+
 /// Remap memory
 #[inline(always)]
 pub unsafe fn mremap(

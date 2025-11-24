@@ -6,6 +6,7 @@ pub const SYS_WRITE: u64 = 1;
 pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
 pub const SYS_MMAP: u64 = 9;
+pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MUNMAP: u64 = 11;
 pub const SYS_RT_SIGRETURN: u64 = 15;
 pub const SYS_MREMAP: u64 = 25;
@@ -51,6 +52,7 @@ pub const MAP_SHARED: i32 = 0x01;
 pub const MAP_PRIVATE: i32 = 0x02;
 pub const MAP_FIXED: i32 = 0x10;
 pub const MAP_ANONYMOUS: i32 = 0x20;
+pub const MAP_POPULATE: i32 = 0x8000;
 
 // mremap() flags
 pub const MREMAP_MAYMOVE: i32 = 1;

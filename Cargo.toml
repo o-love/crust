@@ -31,8 +31,13 @@ crust-syscall = { path = "crust-syscall" }
 [build-dependencies]
 # For generating protobuf code from .proto files
 prost-build = "0.13"
+# For compiling C code
+cc = "1.0"
 
-# Workspace-level profile for restorer optimization
+# Workspace-level profile for restorer
+[profile.dev]
+panic = "abort"           # No unwinding (required for no_std restorer blob)
+
 [profile.release]
 opt-level = "z"           # Optimize for size
 lto = true                # Link-time optimization for better inlining

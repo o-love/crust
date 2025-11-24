@@ -46,9 +46,10 @@ $(RESTORER_RS): src/lib.rs Cargo.toml ../crust-syscall/src/*.rs
 		echo "[OK] Zero relocations in .text!"; \
 	fi
 	@echo ""
-	@echo "=== Extracting .text section ==="
+	@echo "=== Extracting .text and .rodata sections ==="
 	@objcopy -O binary \
 		--only-section=.text \
+		--only-section=.rodata \
 		$(RESTORER_ELF) \
 		$(RESTORER_BIN)
 	@BLOB_SIZE=$$(stat -c%s $(RESTORER_BIN)); \
@@ -70,6 +71,11 @@ $(RESTORER_RS): src/lib.rs Cargo.toml ../crust-syscall/src/*.rs
 	@echo '];' >> $(RESTORER_RS)
 	@echo '' >> $(RESTORER_RS)
 	@echo 'pub const RESTORER_SIZE: usize = RESTORER_BLOB.len();' >> $(RESTORER_RS)
+	@echo '' >> $(RESTORER_RS)
+	@ENTRY_POINT=$$(readelf -h $(RESTORER_ELF) | grep 'Entry point address' | awk '{print $$NF}'); \
+	TEXT_START=$$(readelf -S $(RESTORER_ELF) | grep '\.text' | head -1 | awk '{for(i=1;i<=NF;i++)if($$i=="PROGBITS")print "0x"$$(i+1)}'); \
+	ENTRY_OFFSET=$$(($$ENTRY_POINT - $$TEXT_START)); \
+	echo "pub const RESTORER_ENTRY_OFFSET: usize = $$ENTRY_OFFSET;" >> $(RESTORER_RS)
 	@echo "[OK] Generated $(RESTORER_RS)"
 
 clean:

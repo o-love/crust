@@ -190,9 +190,13 @@ fn test_restore_args_setup() {
         let args = TaskRestoreArgs {
             bootstrap_base: 0x7f0000000000,
             bootstrap_len: 0x1000000,  // 16 MB
+            premap_addr: 0x100000000,
+            premap_len: 0x2000,  // 8 KB premap region
             vma_count: vmas.len(),
             vmas: vmas.as_ptr(),
             sigframe: &sigframe as *const Sigframe as *const u8,
+            fs_base: 0,
+            gs_base: 0,
         };
 
         // Verify args structure
@@ -254,9 +258,13 @@ fn test_end_to_end_injection_task26() {
         let args = TaskRestoreArgs {
             bootstrap_base: blob_addr,
             bootstrap_len: 4096,
+            premap_addr: 0x100000000,
+            premap_len: 0x1000,  // 4 KB premap region
             vma_count: 0,
             vmas: vmas.as_ptr(),
             sigframe: &sigframe as *const Sigframe as *const u8,
+            fs_base: 0,
+            gs_base: 0,
         };
 
         println!("Step 3: Arguments prepared");

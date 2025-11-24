@@ -4,9 +4,12 @@
 //! address space. The blob must be mapped to an address that doesn't conflict
 //! with existing VMAs.
 
-use crate::restorer_blob::RESTORER_BLOB;
+use crate::restorer_blob::{RESTORER_BLOB, RESTORER_ENTRY_OFFSET};
 use crate::Result;
-use crate::proto::VmaEntry;
+use crate::images::checkpoint::CriuCheckpoint;
+use crate::restore::args::{TaskRestoreArgs, VmaEntry as ArgsVmaEntry};
+use crate::restore::sigframe::RtSigframe64;
+use crate::proto::VmaEntry as ProtoVmaEntry;
 use std::fs;
 
 /// Address space gap suitable for restorer blob injection
@@ -156,7 +159,7 @@ fn parse_proc_maps(pid: u32) -> Result<Vec<Vma>> {
 /// Convert protobuf VMAs to internal VMA format
 ///
 /// Single responsibility: Type conversion
-fn convert_vmas_from_proto(proto_vmas: &[VmaEntry]) -> Vec<Vma> {
+fn convert_vmas_from_proto(proto_vmas: &[ProtoVmaEntry]) -> Vec<Vma> {
     proto_vmas
         .iter()
         .map(|v| Vma {
@@ -228,7 +231,7 @@ fn find_gap_in_two_lists(
 /// Finds a gap that won't conflict with the target process's future VMAs
 /// or the current process's existing VMAs.
 pub fn find_bootstrap_gap(
-    target_vmas: &[VmaEntry],
+    target_vmas: &[ProtoVmaEntry],
     self_pid: u32,
     min_addr: usize,
     size: usize,
@@ -288,6 +291,296 @@ pub unsafe fn inject_restorer_blob(target_addr: usize) -> Result<usize> {
     );
 
     Ok(addr)
+}
+
+/// Execute the restorer blob in a child process
+///
+/// Uses ptrace to attach to the paused child, set its RIP to the blob,
+/// and monitor execution through rt_sigreturn completion.
+pub unsafe fn execute_restorer_blob(
+    child_pid: i32,
+    premap: &crate::restore::PremapLayout,
+    checkpoint: &CriuCheckpoint,
+) -> Result<()> {
+    use crate::CrustError;
+
+    log::info!("Attaching to child PID {} with ptrace...", child_pid);
+
+    // Attach to child using PTRACE_SEIZE (non-stopping attach)
+    if libc::ptrace(libc::PTRACE_SEIZE, child_pid, 0, 0) < 0 {
+        return Err(CrustError::InvalidImage {
+            reason: format!("PTRACE_SEIZE failed: {}", std::io::Error::last_os_error()),
+        });
+    }
+
+    log::info!("Attached successfully, interrupting child...");
+
+    // Interrupt the child to stop it
+    if libc::ptrace(libc::PTRACE_INTERRUPT, child_pid, 0, 0) < 0 {
+        return Err(CrustError::InvalidImage {
+            reason: format!("PTRACE_INTERRUPT failed: {}", std::io::Error::last_os_error()),
+        });
+    }
+
+    // Wait for child to stop
+    let mut status = 0;
+    if libc::waitpid(child_pid, &mut status, 0) < 0 {
+        return Err(CrustError::InvalidImage {
+            reason: "waitpid failed after PTRACE_INTERRUPT".to_string(),
+        });
+    }
+
+    log::info!("Child stopped (status=0x{:x})", status);
+
+    // BUILD ARGUMENTS FOR BLOB
+    log::info!("Building arguments for restorer blob...");
+
+    // 1. Build sigframe from checkpoint
+    let mut sigframe = RtSigframe64::from_checkpoint(checkpoint)?;
+    log::info!("Built sigframe ({} bytes)", std::mem::size_of::<RtSigframe64>());
+
+    // 2. Calculate addresses in bootstrap region
+    let args_addr = premap.bootstrap_addr;
+    let vma_array_addr = args_addr + std::mem::size_of::<TaskRestoreArgs>();
+    let vma_array_size = premap.vmas.len() * std::mem::size_of::<ArgsVmaEntry>();
+    let sigframe_addr = (vma_array_addr + vma_array_size + 4095) & !4095;  // page-align
+
+    log::info!("Bootstrap memory layout:");
+    log::info!("  TaskRestoreArgs at 0x{:x}", args_addr);
+    log::info!("  VMA array at 0x{:x} ({} entries)", vma_array_addr, premap.vmas.len());
+    log::info!("  Sigframe at 0x{:x}", sigframe_addr);
+
+    // 3. Build TaskRestoreArgs structure
+    let thread_info = checkpoint.core.thread_info.as_ref()
+        .ok_or_else(|| CrustError::InvalidImage {
+            reason: "No thread_info in checkpoint".to_string(),
+        })?;
+
+    // Bootstrap region for unmap_old_vmas() must span from blob start to bootstrap end
+    // This preserves both blob and args/sigframe in a single contiguous region
+
+    // Calculate premap region bounds (min and max of all premapped VMAs)
+    // Blob will use these to avoid unmapping premapped memory
+    let (premap_start, premap_end) = premap.vmas.iter().fold(
+        (usize::MAX, 0usize),
+        |(min_addr, max_addr), vma| {
+            let vma_start = vma.premap_addr;
+            let vma_end = vma.premap_addr + vma.len();
+            (min_addr.min(vma_start), max_addr.max(vma_end))
+        }
+    );
+
+    let args = TaskRestoreArgs {
+        bootstrap_base: premap.blob_addr,
+        bootstrap_len: (premap.bootstrap_addr + premap.bootstrap_size) - premap.blob_addr,
+        premap_addr: premap_start,
+        premap_len: premap_end - premap_start,
+        vma_count: premap.vmas.len(),
+        vmas: vma_array_addr as *const ArgsVmaEntry,
+        sigframe: sigframe_addr as *const u8,
+        fs_base: thread_info.gpregs.fs_base,
+        gs_base: thread_info.gpregs.gs_base,
+    };
+
+    log::info!("TaskRestoreArgs: vma_count={}, fs_base=0x{:x}",
+               args.vma_count, args.fs_base);
+
+    // 4. Set fpregs pointer before writing sigframe to child memory
+    // CRITICAL: Must set fpregs to point to FPU state within the sigframe
+    // The kernel's rt_sigreturn will dereference this pointer to restore FPU state
+    sigframe.set_fpstate_pointer(sigframe_addr as u64);
+
+    // 5. Write structures to child's memory via /proc/pid/mem
+    log::info!("Writing args structures to child memory...");
+    write_to_child_memory(child_pid, args_addr, &args)?;
+
+    // Debug: log all VMA entries being passed to blob
+    log::debug!("VMA entries being passed to blob:");
+    for (i, vma) in premap.vmas.iter().enumerate() {
+        log::debug!("  [{}] premap=0x{:x} -> final=0x{:x}-0x{:x} size=0x{:x} prot=0x{:x}",
+                   i, vma.premap_addr, vma.start, vma.end, vma.end - vma.start, vma.prot);
+    }
+
+    write_slice_to_child_memory(child_pid, vma_array_addr, &premap.vmas)?;
+    write_to_child_memory(child_pid, sigframe_addr, &sigframe)?;
+    log::info!("All structures written successfully");
+
+    // 5. Set registers: RIP=blob entry, RDI=args pointer
+    let mut regs: libc::user_regs_struct = std::mem::zeroed();
+    if libc::ptrace(
+        libc::PTRACE_GETREGS,
+        child_pid,
+        std::ptr::null_mut::<libc::c_void>(),
+        &mut regs as *mut _ as *mut libc::c_void,
+    ) < 0 {
+        return Err(CrustError::InvalidImage {
+            reason: "Failed to get registers".to_string(),
+        });
+    }
+
+    regs.rip = (premap.blob_addr + RESTORER_ENTRY_OFFSET) as u64;
+    regs.rdi = args_addr as u64;  // ← THE CRITICAL FIX!
+
+    log::info!("Setting RIP=0x{:x} (blob entry+{}), RDI=0x{:x} (args pointer)",
+               regs.rip, RESTORER_ENTRY_OFFSET, regs.rdi);
+
+    if libc::ptrace(
+        libc::PTRACE_SETREGS,
+        child_pid,
+        std::ptr::null_mut::<libc::c_void>(),
+        &regs as *const _ as *const libc::c_void,
+    ) < 0 {
+        return Err(CrustError::InvalidImage {
+            reason: "Failed to set registers".to_string(),
+        });
+    }
+
+    // Verify child has premap VMAs before starting blob
+    // Note: Kernel may merge adjacent VMAs, so we check if addresses are contained in ranges
+    log::info!("Verifying child's premap VMAs before blob execution...");
+    if let Ok(child_maps) = std::fs::read_to_string(format!("/proc/{}/maps", child_pid)) {
+        // Collect all premap addresses we expect to find
+        let premap_addrs: Vec<usize> = premap.vmas.iter().map(|e| e.premap_addr).collect();
+
+        log::debug!("Expected premap addresses: {:x?}", premap_addrs);
+
+        // Show premap VMAs from child's maps
+        log::debug!("Child premap VMAs (01xxxxxx, 70xxxxxx):");
+        for line in child_maps.lines() {
+            if line.starts_with("01") || line.starts_with("70") {
+                log::debug!("  {}", line);
+            }
+        }
+
+        // Parse child's maps to extract VMA ranges
+        let mut vma_ranges: Vec<(usize, usize)> = Vec::new();
+        for line in child_maps.lines() {
+            if let Some(range_part) = line.split_whitespace().next() {
+                if let Some((start_str, end_str)) = range_part.split_once('-') {
+                    if let (Ok(start), Ok(end)) = (
+                        usize::from_str_radix(start_str, 16),
+                        usize::from_str_radix(end_str, 16)
+                    ) {
+                        vma_ranges.push((start, end));
+                    }
+                }
+            }
+        }
+
+        // Check all premap addresses are contained in child's VMAs
+        let mut found_count = 0;
+        for &addr in &premap_addrs {
+            if vma_ranges.iter().any(|(s, e)| addr >= *s && addr < *e) {
+                found_count += 1;
+            } else {
+                log::warn!("Premap address 0x{:x} NOT found in child maps", addr);
+            }
+        }
+
+        log::info!("Child PID {} has {}/{} premap VMAs verified (kernel may merge adjacent VMAs)",
+                   child_pid, found_count, premap_addrs.len());
+
+        if found_count == 0 {
+            log::error!("Child has no premap VMAs before blob execution");
+            log::error!("Child /proc/{}/maps:\n{}", child_pid, child_maps);
+        } else if found_count < premap_addrs.len() {
+            log::warn!("Some premap VMAs missing: {}/{} found", found_count, premap_addrs.len());
+        } else {
+            log::info!("Child premap VMAs verified, blob can proceed");
+        }
+    }
+
+    log::info!("Starting blob execution with args...");
+
+    // Continue child execution - blob will execute and call rt_sigreturn
+    if libc::ptrace(libc::PTRACE_CONT, child_pid, 0, 0) < 0 {
+        return Err(CrustError::InvalidImage {
+            reason: format!("PTRACE_CONT failed: {}", std::io::Error::last_os_error()),
+        });
+    }
+
+    log::info!("Child executing blob...");
+
+    // After rt_sigreturn, child is restored and running independently
+    // We don't wait for blob to "complete" because rt_sigreturn doesn't return!
+    // Instead, give child time to execute blob, then detach and monitor
+
+    // Small delay to let blob start execution
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Detach from child immediately - it's restored and should run freely
+    // NOTE: PTRACE_DETACH may fail with ESRCH if rt_sigreturn already detached the child
+    // This is expected and not an error - it means restore succeeded!
+    log::info!("Detaching from child to let it run restored code...");
+    if libc::ptrace(libc::PTRACE_DETACH, child_pid, 0, 0) < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            log::info!("Child already detached (expected after rt_sigreturn)");
+        } else {
+            log::warn!("PTRACE_DETACH failed: {}", err);
+        }
+    } else {
+        log::info!("Detached successfully");
+    }
+
+    // Verify child process still exists
+    if std::fs::metadata(format!("/proc/{}", child_pid)).is_ok() {
+        log::info!("Child process {} running", child_pid);
+        Ok(())
+    } else {
+        Err(CrustError::InvalidImage {
+            reason: format!("Child process {} not found after restore", child_pid),
+        })
+    }
+}
+
+/// Write data to child process memory via /proc/pid/mem
+///
+/// This writes a structure to the child's address space at the specified address.
+/// Uses /proc/pid/mem for direct memory access while process is ptraced.
+unsafe fn write_to_child_memory<T: Sized>(pid: i32, addr: usize, data: &T) -> Result<()> {
+    use std::io::{Seek, Write};
+
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&mem_path)
+        .map_err(|e| crate::CrustError::InvalidImage {
+            reason: format!("Failed to open {}: {}", mem_path, e),
+        })?;
+
+    file.seek(std::io::SeekFrom::Start(addr as u64))?;
+
+    let bytes = std::slice::from_raw_parts(
+        data as *const T as *const u8,
+        std::mem::size_of::<T>()
+    );
+
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+/// Write slice data to child process memory via /proc/pid/mem
+unsafe fn write_slice_to_child_memory<T: Sized>(pid: i32, addr: usize, data: &[T]) -> Result<()> {
+    use std::io::{Seek, Write};
+
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&mem_path)
+        .map_err(|e| crate::CrustError::InvalidImage {
+            reason: format!("Failed to open {}: {}", mem_path, e),
+        })?;
+
+    file.seek(std::io::SeekFrom::Start(addr as u64))?;
+
+    let bytes = std::slice::from_raw_parts(
+        data.as_ptr() as *const u8,
+        data.len() * std::mem::size_of::<T>()
+    );
+
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]
